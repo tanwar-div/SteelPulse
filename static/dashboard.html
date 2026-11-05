@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SteelPulse &mdash; Plant Operations</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171b21; --line:#262c35; --ink:#e7eaee; --muted:#8b94a1;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --crit:#ff7b72;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--ink)}
+  header{background:var(--panel);border-bottom:1px solid var(--line);padding:16px 26px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  header h1{font-size:17px;margin:0;letter-spacing:.02em}
+  header span{color:var(--muted);font-size:13px}
+  header .pill{margin-left:auto;font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+  main{padding:22px 26px;max-width:1280px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+  .card .label{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .card .value{font-size:24px;font-weight:650;margin-top:5px;font-variant-numeric:tabular-nums}
+  .card .sub{font-size:12px;color:var(--muted);margin-top:3px}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)} .accent{color:var(--accent)}
+  section{margin-top:24px}
+  section h2{font-size:12px;margin:0 0 9px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);font-size:13px}
+  th{background:#1b2027;font-weight:600;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+  tr:last-child td{border-bottom:0}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .sev{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid}
+  .sev.critical{color:var(--crit);border-color:#5d2b28;background:#2b1a1a}
+  .sev.high{color:var(--warn);border-color:#5a4418;background:#2a2113}
+  .sev.medium{color:var(--accent);border-color:#1f425f;background:#152430}
+  .sev.low{color:var(--muted);border-color:var(--line);background:#1b2027}
+  .bar{height:6px;border-radius:3px;background:#20262e;overflow:hidden;margin-top:6px}
+  .bar>div{height:100%;background:var(--accent)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:900px){.cols{grid-template-columns:1fr}}
+  .empty{padding:13px;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:8px}
+  footer{padding:10px 26px 28px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>SteelPulse</h1>
+  <span>Plant operations &mdash; telemetry, maintenance and supply chain</span>
+  <span class="pill" id="pipeline">pipeline &middot; &mdash;</span>
+</header>
+<main>
+  <div class="grid" id="tiles"></div>
+
+  <div class="cols">
+    <section>
+      <h2>Open alerts</h2>
+      <div id="alerts"></div>
+    </section>
+    <section>
+      <h2>Work orders</h2>
+      <div id="workorders"></div>
+    </section>
+  </div>
+
+  <div class="cols">
+    <section>
+      <h2>Parts below reorder point</h2>
+      <div id="parts"></div>
+    </section>
+    <section>
+      <h2>SLA breaches</h2>
+      <div id="breaches"></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Energy consumption &mdash; last 7 days</h2>
+    <div id="energy"></div>
+  </section>
+</main>
+<footer id="updated"></footer>
+
+<script>
+const API_KEY = new URLSearchParams(location.search).get("key") || "supervisor-key";
+const headers = { "X-API-Key": API_KEY };
+
+const num = n => Number(n).toLocaleString();
+const ms = n => Number(n) >= 1000 ? (Number(n)/1000).toFixed(2) + " s" : Number(n).toFixed(0) + " ms";
+const money = n => "$" + Number(n).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+
+function tile(label, value, sub, cls) {
+  return `<div class="card"><div class="label">${label}</div>
+          <div class="value ${cls||""}">${value}</div>
+          <div class="sub">${sub||""}</div></div>`;
+}
+const sev = s => `<span class="sev ${s}">${s}</span>`;
+
+async function get(path) {
+  const res = await fetch(path, {headers});
+  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  return res.json();
+}
+
+async function load() {
+  let k, sla, alerts, orders, parts, energy, pipeline;
+  try {
+    [k, sla, alerts, orders, parts, energy, pipeline] = await Promise.all([
+      get("/api/v1/dashboard/kpis"),
+      get("/api/v1/dashboard/sla-breaches"),
+      get("/api/v1/alerts?open_only=true&limit=12"),
+      get("/api/v1/work-orders?open_only=true&limit=12"),
+      get("/api/v1/inventory/parts?short_only=true"),
+      get("/api/v1/dashboard/energy?days=7"),
+      get("/api/v1/ops/pipeline")
+    ]);
+  } catch (err) {
+    document.getElementById("tiles").innerHTML =
+      `<div class="empty">Could not load (${err.message}). Append ?key=&lt;api-key&gt; to the URL.</div>`;
+    return;
+  }
+
+  document.getElementById("pipeline").textContent =
+    `pipeline · ${pipeline.running ? "running" : "stopped"} · ${pipeline.bus} · ` +
+    `${pipeline.worker_count} workers · ${num(pipeline.pending_messages)} unacked`;
+
+  const completion = k.delivery_completion_pct;
+  document.getElementById("tiles").innerHTML = [
+    tile("Events ingested", num(k.events_total), "all gateways"),
+    tile("Delivery completion", completion.toFixed(2) + "%", `${num(k.dead_lettered)} dead-lettered`,
+         completion >= 99.9 ? "ok" : completion >= 99 ? "warn" : "bad"),
+    tile("Ingest rate", num(k.ingest_throughput_per_sec) + "/s", "sustained over the run"),
+    tile("p95 alert latency", ms(k.alert_latency_ms_p95), "p50 " + ms(k.alert_latency_ms_p50) + " · p99 " + ms(k.alert_latency_ms_p99)),
+    tile("Open alerts", num(k.alerts_by_status.open + k.alerts_by_status.acknowledged),
+         `${num(k.open_by_severity.critical)} critical · ${num(k.open_by_severity.high)} high`,
+         k.open_by_severity.critical ? "bad" : "ok"),
+    tile("Open work orders", num(k.open_work_orders), `${num(k.awaiting_parts)} awaiting parts`),
+    tile("Mean time to repair", k.mean_time_to_repair_hours.toFixed(1) + " h", "completed jobs"),
+    tile("Event backlog", num(k.backlog), "accepted, not yet processed", k.backlog ? "warn" : "ok"),
+    tile("SLA breaches", num(k.sla_breaches), "past deadline", k.sla_breaches ? "bad" : "ok"),
+    tile("Energy, 7 days", num(energy.total_kwh.toFixed(0)) + " kWh", money(energy.estimated_cost) + " estimated")
+  ].join("");
+
+  document.getElementById("alerts").innerHTML = alerts.length ? `<table>
+    <tr><th>Asset</th><th>Condition</th><th>Severity</th><th>Seen</th><th>Latency</th></tr>
+    ${alerts.map(a => `<tr><td>${a.asset_code}</td><td>${a.message}</td>
+      <td>${sev(a.severity)}</td><td class="num">${num(a.occurrences)}</td>
+      <td class="num">${ms(a.detection_latency_ms)}</td></tr>`).join("")}
+  </table>` : `<div class="empty">No open alerts.</div>`;
+
+  document.getElementById("workorders").innerHTML = orders.length ? `<table>
+    <tr><th>Number</th><th>Asset</th><th>Status</th><th>Severity</th><th>Part</th></tr>
+    ${orders.map(o => `<tr><td>${o.number}</td><td>${o.asset_code}</td>
+      <td>${o.status.replace(/_/g," ")}</td><td>${sev(o.severity)}</td>
+      <td>${o.part_number || "&mdash;"}</td></tr>`).join("")}
+  </table>` : `<div class="empty">No open work orders.</div>`;
+
+  document.getElementById("parts").innerHTML = parts.length ? `<table>
+    <tr><th>Part</th><th>Available</th><th>Reorder point</th><th>On hand</th></tr>
+    ${parts.map(p => `<tr><td>${p.part_number}</td>
+      <td class="num bad">${p.available}</td><td class="num">${p.reorder_point}</td>
+      <td class="num">${p.on_hand}</td></tr>`).join("")}
+  </table>` : `<div class="empty">Every tracked part is above its reorder point.</div>`;
+
+  document.getElementById("breaches").innerHTML = sla.count ? `<table>
+    <tr><th>Kind</th><th>Asset</th><th>Severity</th><th>Overdue</th></tr>
+    ${sla.breaches.slice(0,12).map(b => `<tr><td>${b.kind.replace(/_/g," ")}</td>
+      <td>${b.asset_code}</td><td>${sev(b.severity)}</td>
+      <td class="num bad">${b.minutes_overdue !== undefined ? b.minutes_overdue.toFixed(0)+" min" : b.hours_overdue.toFixed(1)+" h"}</td></tr>`).join("")}
+  </table>` : `<div class="empty">Everything is inside its SLA.</div>`;
+
+  const peak = Math.max(...energy.by_asset.map(a => a.kwh), 1);
+  document.getElementById("energy").innerHTML = energy.by_asset.length ? `<table>
+    <tr><th>Asset</th><th>Line</th><th>kWh</th><th>Peak kW</th><th>Cost</th><th>Share</th></tr>
+    ${energy.by_asset.map(a => `<tr><td>${a.asset_code}</td><td>${a.line}</td>
+      <td class="num">${a.kwh.toFixed(1)}</td><td class="num">${a.peak_kw.toFixed(1)}</td>
+      <td class="num">${money(a.estimated_cost)}</td>
+      <td style="width:30%"><div class="bar"><div style="width:${a.kwh/peak*100}%"></div></div></td></tr>`).join("")}
+  </table>` : `<div class="empty">No power telemetry yet.</div>`;
+
+  document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>
