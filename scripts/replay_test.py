@@ -34,8 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import select  # noqa: E402
 
 from app import workorders as wo  # noqa: E402
-from app.bus import Message, get_bus  # noqa: E402
-from app.db import session_scope  # noqa: E402
+from app.bus import Message, current_bus, get_bus  # noqa: E402
+from app.db import get_engine, session_scope  # noqa: E402
+from app.idempotency import get_store  # noqa: E402
 from app.models import (  # noqa: E402
     Alert,
     ReplenishmentOrder,
@@ -238,6 +239,11 @@ def main() -> int:
     report = {
         "attempts": args.attempts,
         "distinct_work_orders_replayed": len(pool),
+        "environment": {
+            "event_bus": getattr(current_bus(), "name", "unknown"),
+            "database": get_engine().dialect.name,
+            "idempotency_backend": get_store().backend,
+        },
         "before": before,
         "after": after,
         "delta": delta,

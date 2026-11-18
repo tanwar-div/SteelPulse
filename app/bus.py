@@ -480,6 +480,15 @@ async def get_bus() -> EventBus:
     return _bus
 
 
+def current_bus() -> EventBus | None:
+    """The resolved bus, or None if nothing has asked for one yet.
+
+    Sync, and does no I/O - for reporting which backend is in use from code
+    that is not already inside the event loop.
+    """
+    return _bus
+
+
 def set_bus(bus: EventBus | None) -> None:
     """Override the process-wide bus (tests, load harness)."""
     global _bus

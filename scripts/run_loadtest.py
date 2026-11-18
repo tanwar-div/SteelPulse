@@ -27,7 +27,8 @@ from sqlalchemy import select  # noqa: E402
 
 from app.bus import get_bus  # noqa: E402
 from app.config import get_settings  # noqa: E402
-from app.db import get_engine, session_scope  # noqa: E402
+from app.db import get_engine, init_db, session_scope  # noqa: E402
+from app.idempotency import get_store  # noqa: E402
 from app.metrics import compute_kpis, percentile  # noqa: E402
 from app.models import Alert, EventStatus, TelemetryEvent, WorkOrder  # noqa: E402
 from app.pipeline.ingest import Reading, ingest_batch  # noqa: E402
@@ -102,8 +103,17 @@ async def run(args) -> dict:
     settings = get_settings()
     bus = await get_bus()
 
+    # Create any missing tables before querying them, so an unseeded database
+    # reports what to do rather than raising "no such table" from the ORM.
+    init_db()
+
     with session_scope() as session:
         rules = get_rule_engine().reload(session)
+
+    if not rules:
+        raise SystemExit(
+            f"no rules in {get_engine().dialect.name} - run scripts/seed_plant.py first"
+        )
 
     simulator = PlantSimulator.from_database(
         fault_probability=args.fault_probability, seed=args.seed
@@ -150,6 +160,18 @@ async def run(args) -> dict:
     return {
         "target_rate_per_sec": args.rate,
         "duration_seconds": args.seconds,
+        # a throughput number means nothing without the stack it ran on
+        "environment": {
+            "event_bus": bus.name,
+            "database": get_engine().dialect.name,
+            "idempotency_backend": get_store().backend,
+            "workers": settings.worker_count,
+            "batch_size": settings.batch_size,
+            "sensors": len(simulator.sensors),
+            "rules": rules,
+            "fault_probability": args.fault_probability,
+            "seed": args.seed,
+        },
         "ingest": {
             "sent": feed_stats["sent"],
             "accepted": feed_stats["accepted"],

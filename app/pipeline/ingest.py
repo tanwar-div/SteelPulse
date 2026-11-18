@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.bus import EventBus
@@ -158,10 +158,19 @@ async def ingest_batch(
     session.commit()
 
     stream_ids = await bus.publish_many(payloads)
-    for event, stream_id in zip(rows, stream_ids, strict=True):
-        event.stream_id = stream_id
-    session.commit()
 
+    # One statement for the batch rather than an UPDATE per row. The write-back
+    # is bookkeeping - the durable record already exists - and at a few hundred
+    # readings a batch those round trips cost more than the insert that earned
+    # them. The sensor touch rides along in the same transaction, so acceptance
+    # is two commits regardless of batch size.
+    session.execute(
+        update(TelemetryEvent),
+        [
+            {"id": event.id, "stream_id": stream_id}
+            for event, stream_id in zip(rows, stream_ids, strict=True)
+        ],
+    )
     _touch_sensors(session, {r.sensor_tag for _, r, _, _ in candidates}, received_at)
     session.commit()
 
@@ -172,6 +181,4 @@ async def ingest_batch(
 
 def _touch_sensors(session: Session, tags: set[str], moment: datetime) -> None:
     """Record liveness so an offline sensor is detectable."""
-    from sqlalchemy import update
-
     session.execute(update(Sensor).where(Sensor.tag.in_(tags)).values(last_seen_at=moment))

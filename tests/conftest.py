@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 os.environ["DATABASE_URL"] = "sqlite+pysqlite:///./test_steelpulse.db"
 os.environ["DATABASE_FALLBACK_URL"] = "sqlite+pysqlite:///./test_steelpulse.db"
+# Hermetic by construction: the suite must behave the same whether or not the
+# developer happens to have Redis or a broker running locally.
+os.environ["REDIS_URL"] = "redis://127.0.0.1:1/0"
+os.environ["BUS_BACKEND"] = "memory"
 os.environ["WORKER_COUNT"] = "2"
 os.environ["BLOCK_MS"] = "10"
 os.environ["RETRY_BASE_DELAY"] = "0.001"
