@@ -166,7 +166,8 @@ async def run(args) -> dict:
             "database": get_engine().dialect.name,
             "idempotency_backend": get_store().backend,
             "workers": settings.worker_count,
-            "batch_size": settings.batch_size,
+            "worker_batch_size": settings.batch_size,
+            "ingest_batch_readings": args.batch,
             "sensors": len(simulator.sensors),
             "rules": rules,
             "fault_probability": args.fault_probability,
@@ -193,6 +194,10 @@ async def run(args) -> dict:
             "end_to_end_rate_per_sec": round(processed / wall, 1) if wall else 0.0,
         },
         "alerting": {
+            # Alerts dedupe per asset+metric+rule, so this percentile rests on
+            # very few samples - report the count beside it rather than let a
+            # p95 over a handful of alerts read like a distribution.
+            "alert_latency_sample_size": len(alert_latencies),
             "alerts_opened": kpis["alerts_total"],
             "work_orders_created": work_orders,
             "alert_latency_ms_p50": percentile(alert_latencies, 50),

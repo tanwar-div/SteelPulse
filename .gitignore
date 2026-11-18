@@ -5,7 +5,11 @@ venv/
 *.db
 *.db-wal
 *.db-shm
-data/
+data/*
+# ...but the two benchmark reports are evidence, not scratch output: they are
+# what the throughput, latency and idempotency claims rest on.
+!data/loadtest_report.json
+!data/replay_report.json
 .pytest_cache/
 .ruff_cache/
 .env

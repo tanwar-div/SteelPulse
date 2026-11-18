@@ -1,0 +1,56 @@
+{
+  "target_rate_per_sec": 275,
+  "duration_seconds": 60,
+  "environment": {
+    "event_bus": "rabbitmq",
+    "database": "postgresql",
+    "idempotency_backend": "redis",
+    "workers": 4,
+    "worker_batch_size": 256,
+    "ingest_batch_readings": 50,
+    "sensors": 15,
+    "rules": 13,
+    "fault_probability": 0.08,
+    "seed": 4071
+  },
+  "ingest": {
+    "sent": 16500,
+    "accepted": 16500,
+    "duplicates": 0,
+    "rejected": 0,
+    "feed_seconds": 60.164,
+    "sustained_rate_per_sec": 274.3,
+    "batch_ingest_ms_p95": 225.13
+  },
+  "delivery": {
+    "accepted_events": 16500,
+    "processed_events": 16500,
+    "completion_pct": 100.0,
+    "dead_lettered": 0,
+    "backlog": 0,
+    "drain_seconds": 0.003,
+    "end_to_end_rate_per_sec": 274.2
+  },
+  "alerting": {
+    "alert_latency_sample_size": 3,
+    "alerts_opened": 3,
+    "work_orders_created": 2,
+    "alert_latency_ms_p50": 123.468,
+    "alert_latency_ms_p95": 126.567,
+    "alert_latency_ms_p99": 126.567
+  },
+  "event_latency": {
+    "p50": 90.175,
+    "p95": 174.857,
+    "p99": 195.566
+  },
+  "worker_stats": {
+    "processed": 16500,
+    "skipped": 0,
+    "failed": 0,
+    "dead_lettered": 0,
+    "alerts_opened": 3,
+    "work_orders_created": 2,
+    "recovered": 0
+  }
+}

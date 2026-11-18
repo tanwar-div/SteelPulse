@@ -1,0 +1,38 @@
+{
+  "attempts": 5000,
+  "distinct_work_orders_replayed": 2,
+  "environment": {
+    "event_bus": "rabbitmq",
+    "database": "postgresql",
+    "idempotency_backend": "redis"
+  },
+  "before": {
+    "events": 16500,
+    "alerts": 3,
+    "work_orders": 2,
+    "replenishments": 0
+  },
+  "after": {
+    "events": 16500,
+    "alerts": 3,
+    "work_orders": 2,
+    "replenishments": 0
+  },
+  "delta": {
+    "events": 0,
+    "alerts": 0,
+    "work_orders": 0,
+    "replenishments": 0
+  },
+  "stats": {
+    "ingest_replays": 5000,
+    "ingest_duplicates_detected": 5000,
+    "ingest_new_events": 0,
+    "message_replays": 5000,
+    "message_replays_skipped": 5000,
+    "generation_replays": 5000,
+    "work_order_numbers_stable": 5000,
+    "work_order_numbers_changed": 0
+  },
+  "passed": true
+}
