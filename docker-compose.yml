@@ -28,6 +28,24 @@ services:
       timeout: 5s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      # guest/guest is refused for non-localhost connections, and the api
+      # container is not localhost, so the broker gets real credentials.
+      RABBITMQ_DEFAULT_USER: steelpulse
+      RABBITMQ_DEFAULT_PASS: steelpulse
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
   api:
     build: .
     ports:
@@ -36,13 +54,18 @@ services:
       STEELPULSE_ENV: docker
       DATABASE_URL: postgresql+psycopg://steelpulse:steelpulse@postgres:5432/steelpulse
       REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://steelpulse:steelpulse@rabbitmq:5672/
+      BUS_BACKEND: ${BUS_BACKEND:-rabbitmq}
       WORKER_COUNT: ${WORKER_COUNT:-4}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   pgdata:
   redisdata:
+  rabbitdata:

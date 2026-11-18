@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from app.bus import MemoryBus
+import pytest
+
+from app.bus import (
+    BACKEND_ORDER,
+    MemoryBus,
+    RabbitStreamBus,
+    RedisStreamBus,
+    get_bus,
+    set_bus,
+)
+from app.config import get_settings
 
 
 async def test_published_messages_come_back_in_order():
@@ -74,3 +84,54 @@ async def test_depth_reports_undelivered_backlog():
 
     await bus.consume("c1", count=2, block_ms=10)
     assert await bus.depth() == 3
+
+
+# --------------------------------------------------------------------------- #
+# Backend contract
+# --------------------------------------------------------------------------- #
+
+CONTRACT = (
+    "publish",
+    "publish_many",
+    "consume",
+    "ack",
+    "claim_stale",
+    "pending_count",
+    "depth",
+    "close",
+)
+
+
+@pytest.mark.parametrize("implementation", [MemoryBus, RedisStreamBus, RabbitStreamBus])
+def test_every_backend_implements_the_bus_contract(implementation):
+    """All three backends are interchangeable behind EventBus."""
+    missing = [name for name in CONTRACT if not callable(getattr(implementation, name, None))]
+    assert missing == [], f"{implementation.__name__} is missing {missing}"
+    assert isinstance(implementation.name, str)
+
+
+@pytest.mark.parametrize(
+    ("requested", "first"),
+    [("auto", "rabbitmq"), ("rabbitmq", "rabbitmq"), ("redis", "redis"), ("memory", "memory")],
+)
+def test_backend_preference_order(requested, first):
+    order = BACKEND_ORDER[requested]
+    assert order[0] == first
+    # every chain ends at the in-process bus, so the suite never needs a broker
+    assert order[-1] == "memory"
+
+
+def test_unknown_backend_falls_back_to_auto():
+    assert BACKEND_ORDER.get("nonsense", BACKEND_ORDER["auto"]) == BACKEND_ORDER["auto"]
+
+
+async def test_memory_bus_is_used_when_no_broker_is_configured(monkeypatch):
+    monkeypatch.setenv("BUS_BACKEND", "memory")
+    get_settings.cache_clear()
+    set_bus(None)
+    try:
+        bus = await get_bus()
+        assert bus.name == "memory"
+    finally:
+        set_bus(None)
+        get_settings.cache_clear()

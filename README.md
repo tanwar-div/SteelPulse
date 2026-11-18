@@ -17,7 +17,7 @@ Two constraints shape the codebase:
   10,000 times describes one job to do. Idempotency is keyed on the
   maintenance need, not the message.
 
-**Stack:** Python · FastAPI · asyncio · Redis Streams · PostgreSQL · Docker
+**Stack:** Python · FastAPI · asyncio · RabbitMQ · Redis Streams · PostgreSQL · Docker
 
 ---
 
@@ -25,7 +25,8 @@ Two constraints shape the codebase:
 
 ```
 gateway        ingest API              event bus              worker pool
-  │     persist + publish      Redis Streams / in-proc     consumer group
+  │     persist + publish    RabbitMQ / Redis / in-proc      competing
+  │                                                          consumers
   ▼            │                       │                         │
 readings ──────┴──────▶ telemetry_events ──▶ stream ──▶ detect ──┬──▶ alert
                (durable before published)                        ├──▶ work order ──▶ reserve part
@@ -44,13 +45,29 @@ published, because an event on the bus that has no durable row would be lost
 with no way to notice. From there it moves `received → processed`, or parks in
 `failed` / `dead_letter` where it stays queryable and replayable.
 
-Redis Streams consumer groups give at-least-once delivery: a message stays in
-the group's pending list until acked, so a worker that dies mid-message leaves
-its entry behind rather than dropping it. The recovery loop claims entries
-whose consumer has gone quiet (`XAUTOCLAIM`) and runs them again. An
-in-process bus implements the same semantics — pending list, explicit ack,
+Three backends sit behind one `EventBus` protocol, chosen with `BUS_BACKEND`,
+and all three give at-least-once delivery:
+
+**RabbitMQ** (default in Docker) publishes to a durable direct exchange and
+every worker consumes one durable queue, so the broker round-robins between
+competing consumers. A prefetch window bounds in-flight work, acks are
+explicit, and unacked messages are the broker's responsibility — they return
+to the queue when a channel drops. The recovery loop requeues anything that
+has sat unacked past `STALE_CLAIM_MS` (`basic.nack`, requeue), and it arrives
+again through the normal consume path flagged `redelivered`.
+
+**Redis Streams** uses consumer groups instead: a message stays in the group's
+pending-entries list until acked, and the recovery loop claims entries whose
+consumer has gone quiet (`XAUTOCLAIM`) and runs them again.
+
+**In-process** implements the same semantics — pending list, explicit ack,
 stale claim — so the pipeline, the tests and the load scripts behave
 identically with no broker running.
+
+The semantic difference worth knowing: Redis hands a stale entry straight back
+to the claiming worker, while AMQP has no client-visible pending list, so the
+same recovery trigger becomes a requeue and the redelivery comes back through
+the queue. Same guarantee, different owner.
 
 At-least-once only works if processing is safe to repeat, so it is: a message
 whose event is already `processed` is acked and dropped.
@@ -124,7 +141,7 @@ to an append-only stock ledger.
 ```bash
 make install      # venv + dependencies
 make seed         # a 5-asset plant: furnace, mill, hydraulics, cooling, drive
-make test         # 124 tests
+make test         # 133 tests
 make dev          # http://localhost:8000
 ```
 
@@ -240,7 +257,7 @@ app/
   main.py              FastAPI app, lifespan, worker pool startup
   config.py            environment-driven settings
   models.py            assets, sensors, rules, events, alerts, work orders, inventory
-  bus.py               Redis Streams consumer group + in-process equivalent
+  bus.py               RabbitMQ queue + Redis Streams group + in-process equivalent
   rules.py             rule engine with per-sensor evaluation windows
   alerts.py            alert dedupe, escalation, suppression
   workorders.py        idempotent generation, parts, completion
@@ -270,7 +287,10 @@ The ones worth knowing:
 | Variable | Default | Effect |
 |---|---|---|
 | `DATABASE_URL` | local Postgres | falls back to `DATABASE_FALLBACK_URL` (SQLite) if unreachable |
-| `REDIS_URL` | `redis://localhost:6379/0` | falls back to the in-process bus if unreachable |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis Streams bus and idempotency cache |
+| `RABBITMQ_URL` | `amqp://steelpulse:steelpulse@localhost:5672/` | AMQP broker |
+| `BUS_BACKEND` | `auto` | `rabbitmq` \| `redis` \| `memory` \| `auto` (tries each in that order) |
+| `RABBITMQ_PREFETCH` | `512` | unacked messages the broker will push per consumer |
 | `WORKER_COUNT` | `4` | consumers in the pool |
 | `BATCH_SIZE` | `256` | messages read per consumer poll |
 | `MAX_DELIVERY_ATTEMPTS` | `5` | redeliveries before an event is dead-lettered |
@@ -281,7 +301,18 @@ The ones worth knowing:
 
 ## Deployment
 
-`docker-compose.yml` runs the API alongside PostgreSQL and Redis. Scale the
-pipeline horizontally by running more API replicas or raising `WORKER_COUNT`:
-the Redis consumer group distributes messages across every consumer, and the
-idempotency keys mean adding workers cannot produce duplicate work orders.
+`docker-compose.yml` runs the API alongside PostgreSQL, Redis and RabbitMQ,
+with `BUS_BACKEND=rabbitmq` (the broker's management UI is on :15672). Scale
+the pipeline horizontally by running more API replicas or raising
+`WORKER_COUNT`: every worker consumes the same durable queue, so the broker
+round-robins across all of them, and the idempotency keys mean adding workers
+cannot produce duplicate work orders.
+
+To measure a specific backend, pin it and run the load test:
+
+```bash
+BUS_BACKEND=rabbitmq python scripts/run_loadtest.py --rate 250 --seconds 60
+```
+
+The startup banner and `GET /health` both report the bus actually in use, so a
+fallback to another backend is never silent.

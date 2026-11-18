@@ -28,10 +28,22 @@ class Settings:
             "DATABASE_FALLBACK_URL", "sqlite+pysqlite:///./steelpulse.db"
         )
         self.redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.rabbitmq_url = os.getenv(
+            "RABBITMQ_URL", "amqp://steelpulse:steelpulse@localhost:5672/"
+        )
 
         # Event bus
+        # rabbitmq | redis | memory | auto (tries each in that order)
+        self.bus_backend = os.getenv("BUS_BACKEND", "auto").strip().lower()
         self.telemetry_stream = os.getenv("TELEMETRY_STREAM", "steelpulse.telemetry")
         self.consumer_group = os.getenv("CONSUMER_GROUP", "detectors")
+
+        # AMQP topology. The queue is the consumer group's equivalent: every
+        # worker consumes the one queue, so the broker round-robins between them.
+        self.rabbitmq_exchange = os.getenv("RABBITMQ_EXCHANGE", "steelpulse.telemetry")
+        self.rabbitmq_queue = os.getenv("RABBITMQ_QUEUE", "steelpulse.telemetry.detectors")
+        self.rabbitmq_prefetch = int(os.getenv("RABBITMQ_PREFETCH", "512"))
+        self.rabbitmq_connect_timeout = float(os.getenv("RABBITMQ_CONNECT_TIMEOUT", "3"))
         self.worker_count = int(os.getenv("WORKER_COUNT", "4"))
         self.batch_size = int(os.getenv("BATCH_SIZE", "256"))
         self.block_ms = int(os.getenv("BLOCK_MS", "50"))

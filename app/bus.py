@@ -1,14 +1,19 @@
 """Event bus with at-least-once delivery.
 
-Redis Streams with consumer groups is the deployment target: publishing
-appends to the stream, each consumer group tracks its own cursor, and a
-message stays in the group's pending-entries list until it is acked. A
-consumer that dies mid-message leaves its entry pending, and another worker
-claims it once it goes stale - that is the fault-recovery path.
+Three backends behind one protocol, chosen by BUS_BACKEND:
 
-An in-process implementation with the same semantics (pending list, ack,
-stale claim) takes over when Redis is unreachable, so the pipeline, the tests
-and the load scripts behave identically with no broker running.
+    rabbitmq  a durable queue on a direct exchange, consumed with a prefetch
+              window and explicit acks. Unacked work is redelivered by the
+              broker, which is AMQP's answer to a dead consumer.
+    redis     Redis Streams with consumer groups: a message stays in the
+              group's pending-entries list until acked, and a stale entry is
+              claimed by another worker (XAUTOCLAIM).
+    memory    the same semantics in-process - pending list, ack, stale claim -
+              so the pipeline, the tests and the load scripts behave
+              identically with no broker running.
+
+The guarantee is the same in all three: nothing is lost, something may arrive
+twice, and the consumer is idempotent so that is safe.
 """
 
 from __future__ import annotations
@@ -232,26 +237,246 @@ class RedisStreamBus:
         await self._redis.aclose()
 
 
+# --------------------------------------------------------------------------- #
+# RabbitMQ implementation
+# --------------------------------------------------------------------------- #
+
+
+class RabbitStreamBus:
+    """AMQP queue with a prefetch window, explicit acks and broker redelivery.
+
+    The mapping from the Redis Streams model is close but not identical, and
+    the difference is the interesting part:
+
+    * a consumer group becomes one durable queue that every worker consumes,
+      so the broker round-robins deliveries instead of each worker reading a
+      private cursor;
+    * acking is per delivery tag rather than per stream id;
+    * there is no client-visible pending-entries list to sweep. An unacked
+      message is the broker's responsibility: it goes back on the queue when
+      the channel drops. ``claim_stale`` therefore requeues work that has sat
+      unacked too long (basic.nack, requeue=true) and lets it arrive again
+      through the normal consume path.
+
+    Deliveries are pushed into a local buffer rather than pulled one at a time
+    with basic.get, because a round trip per message would cap throughput an
+    order of magnitude below the prefetch-window approach.
+    """
+
+    name = "rabbitmq"
+
+    def __init__(self, connection, channel, queue, exchange, routing_key: str, prefetch: int):
+        self._connection = connection
+        self._channel = channel
+        self._queue = queue
+        self._exchange = exchange
+        self._routing_key = routing_key
+        self._prefetch = prefetch
+        self._buffer: asyncio.Queue = asyncio.Queue()
+        self._unacked: dict[str, tuple[object, float]] = {}
+        self._consumer_tag: str | None = None
+        self.requeued_total = 0
+
+    @classmethod
+    async def connect(
+        cls,
+        url: str,
+        exchange_name: str,
+        queue_name: str,
+        prefetch: int,
+        timeout: float,
+    ) -> RabbitStreamBus:
+        import aio_pika
+
+        connection = await asyncio.wait_for(aio_pika.connect_robust(url), timeout=timeout)
+        channel = await connection.channel()
+        # Bound in-flight work: the broker will not push more than this many
+        # unacked messages, which is what keeps a burst from exhausting memory.
+        await channel.set_qos(prefetch_count=prefetch)
+
+        exchange = await channel.declare_exchange(
+            exchange_name, aio_pika.ExchangeType.DIRECT, durable=True
+        )
+        queue = await channel.declare_queue(queue_name, durable=True)
+        await queue.bind(exchange, routing_key=queue_name)
+
+        bus = cls(connection, channel, queue, exchange, queue_name, prefetch)
+        bus._consumer_tag = await queue.consume(bus._on_delivery, no_ack=False)
+        return bus
+
+    async def _on_delivery(self, message) -> None:
+        """Buffer a delivery. Nothing is acked until the pipeline says so."""
+        await self._buffer.put(message)
+
+    def _encode(self, payload: dict):
+        import aio_pika
+
+        return aio_pika.Message(
+            body=json.dumps(payload, separators=(",", ":")).encode(),
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            content_type="application/json",
+        )
+
+    async def publish(self, payload: dict) -> str:
+        return (await self.publish_many([payload]))[0]
+
+    async def publish_many(self, payloads: list[dict]) -> list[str]:
+        await asyncio.gather(
+            *(
+                self._exchange.publish(self._encode(payload), routing_key=self._routing_key)
+                for payload in payloads
+            )
+        )
+        # AMQP has no broker-assigned message id, so the event key stands in.
+        return [str(payload.get("event_key", "")) for payload in payloads]
+
+    async def consume(self, consumer: str, count: int, block_ms: int) -> list[Message]:
+        """Take up to ``count`` buffered deliveries, waiting at most block_ms."""
+        batch: list[Message] = []
+        try:
+            first = await asyncio.wait_for(self._buffer.get(), timeout=block_ms / 1000)
+        except TimeoutError:
+            return batch
+
+        delivery = first
+        while True:
+            batch.append(self._track(delivery))
+            if len(batch) >= count:
+                break
+            try:
+                delivery = self._buffer.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        return batch
+
+    def _track(self, delivery) -> Message:
+        message_id = str(delivery.delivery_tag)
+        self._unacked[message_id] = (delivery, time.monotonic())
+        return Message(
+            id=message_id,
+            payload=json.loads(delivery.body),
+            delivery_count=2 if delivery.redelivered else 1,
+        )
+
+    async def ack(self, message_ids: list[str]) -> int:
+        acked = 0
+        for message_id in message_ids:
+            entry = self._unacked.pop(message_id, None)
+            if entry is None:
+                continue
+            try:
+                await entry[0].ack()
+                acked += 1
+            except Exception:  # pragma: no cover - channel died mid-ack
+                # Not acking is safe: the broker redelivers it.
+                log.warning("ack failed for delivery %s", message_id)
+        return acked
+
+    async def claim_stale(self, consumer: str, min_idle_ms: int, count: int) -> list[Message]:
+        """Requeue work that has sat unacked too long.
+
+        Returns an empty list by design: the redelivery arrives through the
+        normal consume path with ``redelivered`` set, rather than being handed
+        straight back to the caller the way XAUTOCLAIM does.
+        """
+        cutoff = time.monotonic() - min_idle_ms / 1000
+        stale = [(mid, entry) for mid, entry in list(self._unacked.items()) if entry[1] <= cutoff][
+            :count
+        ]
+
+        for message_id, (delivery, _delivered_at) in stale:
+            self._unacked.pop(message_id, None)
+            try:
+                await delivery.nack(requeue=True)
+                self.requeued_total += 1
+            except Exception:  # pragma: no cover - depends on broker state
+                log.warning("requeue failed for delivery %s", message_id)
+        if stale:
+            log.info("requeued %d stale deliveries for redelivery", len(stale))
+        return []
+
+    async def pending_count(self) -> int:
+        return len(self._unacked)
+
+    async def depth(self) -> int:
+        """Queue backlog, read on a throwaway channel so a failed passive
+        declare cannot take the consumer's channel down with it."""
+        try:
+            async with self._connection.channel() as channel:
+                queue = await channel.declare_queue(self._queue.name, passive=True)
+                return int(queue.declaration_result.message_count or 0)
+        except Exception:  # pragma: no cover - depends on broker state
+            return 0
+
+    async def close(self) -> None:
+        try:
+            if self._consumer_tag is not None:
+                await self._queue.cancel(self._consumer_tag)
+        except Exception:  # pragma: no cover
+            pass
+        await self._connection.close()
+
+
+# --------------------------------------------------------------------------- #
+# Backend selection
+# --------------------------------------------------------------------------- #
+
 _bus: EventBus | None = None
 
+BACKEND_ORDER = {
+    "auto": ("rabbitmq", "redis", "memory"),
+    "rabbitmq": ("rabbitmq", "memory"),
+    "redis": ("redis", "memory"),
+    "memory": ("memory",),
+}
 
-async def get_bus() -> EventBus:
-    """Process-wide bus, Redis if reachable and in-process otherwise."""
-    global _bus
-    if _bus is not None:
-        return _bus
-    settings = get_settings()
-    try:
-        _bus = await RedisStreamBus.connect(
+
+async def _connect(backend: str, settings) -> EventBus | None:
+    if backend == "rabbitmq":
+        return await RabbitStreamBus.connect(
+            settings.rabbitmq_url,
+            settings.rabbitmq_exchange,
+            settings.rabbitmq_queue,
+            settings.rabbitmq_prefetch,
+            settings.rabbitmq_connect_timeout,
+        )
+    if backend == "redis":
+        return await RedisStreamBus.connect(
             settings.redis_url,
             settings.telemetry_stream,
             settings.consumer_group,
             settings.stream_maxlen,
         )
-        log.info("event bus: redis streams (%s)", settings.telemetry_stream)
-    except Exception as exc:  # pragma: no cover - depends on local services
-        log.info("event bus: in-process (redis unreachable: %s)", exc.__class__.__name__)
-        _bus = MemoryBus(maxlen=settings.stream_maxlen)
+    return MemoryBus(maxlen=settings.stream_maxlen)
+
+
+async def get_bus() -> EventBus:
+    """Process-wide bus: the configured backend, or the next one that answers.
+
+    Falling back rather than failing is deliberate - the suite and the load
+    scripts must run with no services - but the chosen backend is reported by
+    ``/health`` and the startup log, so a silent downgrade is still visible.
+    """
+    global _bus
+    if _bus is not None:
+        return _bus
+
+    settings = get_settings()
+    requested = settings.bus_backend
+    order = BACKEND_ORDER.get(requested, BACKEND_ORDER["auto"])
+
+    for backend in order:
+        try:
+            _bus = await _connect(backend, settings)
+        except Exception as exc:  # pragma: no cover - depends on local services
+            level = log.warning if backend == requested else log.info
+            level("event bus: %s unavailable (%s)", backend, exc.__class__.__name__)
+            continue
+        if _bus is not None:
+            log.info("event bus: %s", _bus.name)
+            return _bus
+
+    _bus = MemoryBus(maxlen=settings.stream_maxlen)
     return _bus
 
 
